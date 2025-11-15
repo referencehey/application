@@ -1,5 +1,7 @@
 --// made by referncehey
 
+--// VIDEO EXAMPLE LINK: https://drive.google.com/file/d/1Ozu-wyZjwD6uYKHXEqRPPLxR3Wj-m8mD/view?usp=sharing
+
 local module = {
 	Inventory = nil,
 	Equipped = nil,
