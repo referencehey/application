@@ -1,35 +1,37 @@
---[[
-	WeaponSystemHandler.lua
-	Description: A modular client-side weapon controller handling procedural viewmodels, 
-	raycasting logic, ammo management, and HUD synchronization.
---]]
-
 local module = {}
 
--- [[ CONFIGURATION & MAPPINGS ]]
+-- ============================================================
+--  CONFIGURATION
+-- ============================================================
+
 local KEY_TO_SLOT = {
-	[Enum.KeyCode.One] = 1, [Enum.KeyCode.Two] = 2, [Enum.KeyCode.Three] = 3,
-	[Enum.KeyCode.Four] = 4, [Enum.KeyCode.Five] = 5, [Enum.KeyCode.Six] = 6,
-	[Enum.KeyCode.Seven] = 7, [Enum.KeyCode.Eight] = 8, [Enum.KeyCode.Nine] = 9,
+	[Enum.KeyCode.One] = 1,
+	[Enum.KeyCode.Two] = 2,
+	[Enum.KeyCode.Three] = 3,
+	[Enum.KeyCode.Four] = 4,
+	[Enum.KeyCode.Five] = 5,
+	[Enum.KeyCode.Six] = 6,
+	[Enum.KeyCode.Seven] = 7,
+	[Enum.KeyCode.Eight] = 8,
+	[Enum.KeyCode.Nine] = 9,
 	[Enum.KeyCode.Zero] = 0,
 }
 
--- [[ SERVICES ]]
+-- ============================================================
+--  SERVICES
+-- ============================================================
+
 local Plrs = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local TS = game:GetService("TweenService")
-local SG = game:GetService("StarterGui")
 local UIS = game:GetService("UserInputService")
-local RunS = game:GetService("RunService")
-local L = game:GetService("Lighting")
-local Debris = game:GetService("Debris")
-local CAS = game:GetService("ContextActionService")
 
--- [[ RESOURCE PATHS ]]
+-- ============================================================
+--  FOLDERS
+-- ============================================================
+
 local AssetsFolder = RS:WaitForChild("Assets")
 local UIFolder = AssetsFolder:WaitForChild("UI")
-local GunsFolder = AssetsFolder:WaitForChild("Guns")
-local WeaponModelsFolder = AssetsFolder:WaitForChild("WeaponModels")
 local VFXFolder = AssetsFolder:WaitForChild("VFX")
 local SFXFolder = AssetsFolder:WaitForChild("SFX")
 
@@ -41,95 +43,201 @@ local ClientModulesFolder = SharedFolder:WaitForChild("ClientModules")
 local RemotesFolder = RS:WaitForChild("Remotes")
 local GunMechanicsRemotes = RemotesFolder:WaitForChild("GunMechanics")
 
--- [[ MODULE DEPENDENCIES ]]
+-- ============================================================
+--  MODULES
+-- ============================================================
+
 local Weapons = require(ConfigFolder:WaitForChild("Weapons"))
+
 local DebugService = require(UtilsFolder:WaitForChild("DebugService"))
 local DeviceService = require(UtilsFolder:WaitForChild("DeviceService"))
-local Crosshair = require(ClientModulesFolder:WaitForChild("CrosshairHandler"))
-local SFX = require(ClientModulesFolder:WaitForChild("SFXHandler"))
+local UIService = require(UtilsFolder:WaitForChild("UIService"))
 
--- [[ CONSTANTS ]]
+local SFX = require(ClientModulesFolder:WaitForChild("SFXHandler"))
+local WeaponHUD = require(ClientModulesFolder:WaitForChild("WeaponHUDHandler"))
+local Camera = require(ClientModulesFolder:WaitForChild("CameraHandler"))
+local Crosshair = require(ClientModulesFolder:WaitForChild("CrosshairHandler"))
+local PlayerStatsHandler = require(ClientModulesFolder:WaitForChild("PlayerStatsHandler"))
+
+-- ============================================================
+--  CONSTANTS
+-- ============================================================
+
 local player = Plrs.LocalPlayer
-local pGui = player:WaitForChild("PlayerGui")
+
 local camera = workspace.CurrentCamera
 
--- [[ UI REFERENCES ]]
-local gui = pGui:WaitForChild("WeaponHUD")
-local slotsContainer = gui:WaitForChild("Slots")
-local ammoFrame = gui:WaitForChild("Ammo")
-local ammoLabel = ammoFrame:WaitForChild("Ammo")
-local weaponSlotTemplate = UIFolder:WaitForChild("WeaponSlotTemplate")
+-- ============================================================
+--  VARIABLES
+-- ============================================================
 
--- [[ STATE MANAGEMENT ]]
-local slots = {}
-local equippedWeapon
 local weaponData = {}
 
--- Viewmodel States
-local currentViewmodel, viewmodelCon
-local jumpOffset = 0
-local recoilOffset = CFrame.new()
-local bobWeight = 0
 local lastShot = 0
+local damageIndicators = {}
 
--- Firing/Movement States
-local isFiring = false
-local isReloading = false
-local currentSpread = 0
-local lastFireTime = 0
-local camRecoil = CFrame.new()
-local swayOffset = CFrame.new()
+-- Object pooling to reuse particle parts for better performance
+-- This prevents lag from creating/destroying hundreds of parts during combat
+local particlePartPool = {}
+local activeParticleParts = {}
 
--- ADS (Aim Down Sights) States
-local isAiming = false
-local adsAlpha = 0 -- Interpolation factor: 0 (Hip) to 1 (ADS)
-local defaultFOV = 70
+-- ============================================================
+--  FUNCTIONS
+-- ============================================================
 
--- UI Visual States
-local ammoShake = 0 
-local originalAmmoPos = ammoLabel.Position
-local isFlashing = false
+local function isAlive()
+	local char = player.Character; if not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid"); if not hum then return end
+	return hum.Health > 0
+end
 
--- [[ HELPER FUNCTIONS ]]
+local function returnPartToPool(part)
+	-- Clean up children before returning to pool
+	-- Prevents memory leaks and ensures parts are fresh when reused
+	for _, child in part:GetChildren() do
+		if child:IsA("Attachment") or child:IsA("BillboardGui") then
+			child:Destroy()
+		end
+	end
+	
+	part.Parent = nil
+	activeParticleParts[part] = nil
+	table.insert(particlePartPool, part)
+end
 
---- Creates a temporary proxy part to host attachments/particles for VFX
-local function createTempParticlePart(lifetime, pos)
-	local part = Instance.new("Part")
-	part.Size = Vector3.new(0, 0, 0); part.Transparency = 1; part.Anchored = true
-	part.CanCollide = false; part.CanQuery = false; part.CanTouch = false
-	part.Position = pos; part.Parent = workspace
-	Debris:AddItem(part, lifetime)
+local function getPartFromPool()
+	if #particlePartPool > 0 then
+		return table.remove(particlePartPool)
+	else
+		-- Create new part if pool is empty
+		local part = Instance.new("Part")
+		part.Size = Vector3.new(0, 0, 0)
+		part.Transparency = 1
+		part.CanCollide = false
+		part.CanQuery = false
+		part.CanTouch = false
+		part.Anchored = true
+		return part
+	end
+end
+
+local function createTempParticlePart(lifetime, pos, nonVolatile)
+	local part = getPartFromPool()
+	part.Position = pos
+	part.Parent = workspace
+	
+	-- nonVolatile parts are managed manually (like damage indicators)
+	if not nonVolatile then
+		local cleanupTask = task.delay(lifetime, function()
+			if part.Parent then
+				returnPartToPool(part)
+			end
+		end)
+		activeParticleParts[part] = cleanupTask
+	end
+
 	return part
 end
 
---- Triggers UI feedback when attempting to fire with an empty clip
-local function noAmmoVisuals()
-	if isFlashing then return end
-	isFlashing = true
-	
-	SFX.PlaySoundEffect(SFXFolder.NoAmmo)
-	ammoShake = 24 -- Trigger RenderStepped shake logic
+local function pulseVisual(guiObject)
+	local popTween = TS:Create(guiObject, TweenInfo.new(0.05, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = UDim2.fromScale(3, 1.5)})
+	local settleTween = TS:Create(guiObject, TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Size = UDim2.fromScale(2, 1)})
 
-	local originalColor = Color3.fromRGB(255, 255, 255) 
-	local flashColor = Color3.fromRGB(255, 50, 50)
-
-	local flashInfo = TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 0, true)
-	local flashTween = TS:Create(ammoLabel, flashInfo, {TextColor3 = flashColor})
-
-	task.spawn(function()
-		flashTween:Play()
-		flashTween.Completed:Wait()
-		ammoLabel.TextColor3 = originalColor
-		isFlashing = false
+	popTween:Play()
+	popTween.Completed:Once(function()
+		settleTween:Play()
 	end)
 end
 
---- Procedural Visual Effects: Impact, Blood, and Tracers
+local function damageIndicator(pos, damage, hitPart)
+    local hitChar = hitPart.Parent
+    local indicatorData = damageIndicators[hitChar]
+    local valTi = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+    -- Nested function to handle fading out the damage label
+
+    local function startFadeOut(data)
+        if not data.DamageLabel or not data.DamageLabel.Parent then return end
+        
+        local fadeTi = TweenInfo.new(1, Enum.EasingStyle.Cubic, Enum.EasingDirection.In)
+        
+        TS:Create(data.DamageLabel, fadeTi, {Position = UDim2.fromScale(0.5, -0.5)}):Play()
+        
+        UIService.FadeGuiObject({
+            Object = data.DamageLabel,
+            TweenInfo = fadeTi,
+        })
+
+        task.delay(1, function()
+            if data.Part then returnPartToPool(data.Part) end
+        end)
+        damageIndicators[hitChar] = nil
+    end
+
+    -- Update existing indicator if already showing damage for this character
+    -- This stacks damage numbers instead of creating multiple overlapping labels
+    if indicatorData and indicatorData.DamageLabel.Parent then
+        indicatorData.Part.Position = pos
+        indicatorData.Damage += damage
+
+        if indicatorData.TimeEndedTask then 
+            task.cancel(indicatorData.TimeEndedTask) 
+        end
+
+        pulseVisual(indicatorData.DamageLabel)
+        TS:Create(indicatorData.DisplayValue, valTi, {Value = indicatorData.Damage}):Play()
+
+        indicatorData.TimeEndedTask = task.delay(1, function()
+            startFadeOut(indicatorData)
+        end)
+        
+        return
+    end
+    
+    -- Create new damage indicator
+    local part = createTempParticlePart(5, pos, true) 
+    local billing = UIFolder.DamageIndicator:Clone()
+    local label = billing.Damage
+    
+	billing.Parent = part
+
+    local displayValue = Instance.new("NumberValue")
+    displayValue.Value = 0
+    displayValue.Parent = label
+    
+    displayValue:GetPropertyChangedSignal("Value"):Connect(function()
+        local currentVal = displayValue.Value
+        label.Text = "-"..math.round(currentVal)
+        label.TextColor3 = UIService.GetGradientColor(UIFolder.DamageColor, currentVal / 100)
+    end)
+
+    label.Position = UDim2.fromScale(0.5, 0.5)
+    label.Text = "-0"
+    
+    pulseVisual(label)
+    TS:Create(displayValue, valTi, {Value = damage}):Play()
+
+    local newData = {
+        Part = part,
+        DamageLabel = label,
+        HitChar = hitChar,
+        Damage = damage,
+        DisplayValue = displayValue,
+    }
+    
+    damageIndicators[hitChar] = newData
+    newData.TimeEndedTask = task.delay(1, function()
+        startFadeOut(newData)
+    end)
+end
+
 local function impactEffect(pos)
 	local hitPart = createTempParticlePart(0.5, pos)
 	local attachment = Instance.new("Attachment", hitPart)
+
 	local sparks = VFXFolder.BulletSparks:Clone()
 	sparks.Parent = attachment
+
 	sparks:Emit(3)
 end
 
@@ -137,84 +245,75 @@ local function bloodSplatter(pos)
 	local hitPart = createTempParticlePart(1, pos)
 	local attachment = VFXFolder.BloodSplatter:Clone()
 	attachment.Parent = hitPart
+
 	for _, particle in attachment:GetChildren() do
-		particle:Emit(particle:GetAttribute("EmitAmount") or 3)
+		if particle:IsA("ParticleEmitter") then particle:Emit(particle:GetAttribute("EmitAmount") or 3) end
 	end
 end
 
---- Logic for rendering 3D tracers using Beams and Attachments
 local function createBeam(startMuzzle, endPos)
 	if not startMuzzle then return end
+
 	local distance = (startMuzzle.WorldPosition - endPos).Magnitude
-	if distance < 1 then return end 
+	if distance < 1 then return end
 
 	local part = createTempParticlePart(0.2, endPos)
-	local att0 = Instance.new("Attachment", part); att0.WorldPosition = startMuzzle.WorldPosition
-	local att1 = Instance.new("Attachment", part); att1.WorldPosition = endPos
+	local att0 = Instance.new("Attachment", part)
+	local att1 = Instance.new("Attachment", part)
+	att0.WorldPosition = startMuzzle.WorldPosition
+	att1.WorldPosition = endPos
 
 	local beam = VFXFolder.BulletBeam:Clone()
-	beam.Attachment0 = att0; beam.Attachment1 = att1
+	beam.Attachment0 = att0
+	beam.Attachment1 = att1
+
 	beam.Parent = part
 
 	TS:Create(beam, TweenInfo.new(0.05, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
-		Width0 = 0, Width1 = 0, TextureSpeed = 5
+		Width0 = 0, 
+		Width1 = 0,
+		TextureSpeed = 5
 	}):Play()
 end
 
---- Procedural Recoil: Updates CFrame offsets for the viewmodel and camera
-local function applyRecoil()
-	local weaponInfo = Weapons[equippedWeapon]
-	if not weaponInfo then return end
-
-	-- Convert config degrees to radians for CFrame math
-	local vKick = math.rad(math.random(weaponInfo.VRecoil[1], weaponInfo.VRecoil[2]) * 5)
-	local hKick = math.rad(math.random(weaponInfo.HRecoil[1], weaponInfo.HRecoil[2]) * 5)
-
-	recoilOffset = recoilOffset * CFrame.Angles(vKick, hKick, 0) * CFrame.new(0, 0, 0.2)
-	camRecoil = camRecoil * CFrame.Angles(vKick * 0.3, hKick * 0.3, 0)
-end
-
-local function updateAmmoCount(weaponName: string)
-	local data = weaponData[weaponName]
-	if not data then return end
-	ammoLabel.Text = "Ammo: "..data.Ammo.."/"..data.StoredAmmo
-	ammoFrame.Visible = true
-end
-
--- [[ CORE WEAPON LOGIC ]]
-
---- Primary Shooting Logic: Handles ammo, spread expansion, and Raycast validation
 local function shoot()
-	if not equippedWeapon or isReloading then return end
-	local weaponInfo = Weapons[equippedWeapon]
+	if not isAlive() then return end
 	
-	if weaponData[equippedWeapon].Ammo <= 0 then noAmmoVisuals() return end
-	weaponData[equippedWeapon].Ammo -= weaponInfo.Bullets
+	local equippedWeapon = WeaponHUD.EquippedWeapon
 	
+	if not equippedWeapon or Camera.IsReloading then return end
+	
+	local weaponInfo = Weapons[equippedWeapon]; if not weaponInfo then return end
+	local data = weaponData[equippedWeapon]; if not data then return end
+	
+	if data.Ammo <= 0 then WeaponHUD.NoAmmoVisuals(); return end
+	data.Ammo -= weaponInfo.Bullets
+
 	SFX.PlaySoundEffect(SFXFolder.Gunshot)
-	updateAmmoCount(equippedWeapon)
+	WeaponHUD.UpdateAmmoCount(data)
 
-	-- Procedural Spread Expansion
-	if os.clock() - lastShot > weaponInfo.FireRate * 2 then 
-		currentSpread = weaponInfo.MinSpread
-	else 
-		currentSpread = math.clamp(currentSpread + weaponInfo.SpreadIncrement, weaponInfo.MinSpread, weaponInfo.MaxSpread) 
-	end
-	
-	lastShot = os.clock()
+	-- Reset spread if player hasn't shot in a while
+	-- Rewards controlled bursts instead of spray and pray
+	if tick() - lastShot > weaponInfo.FireRate * 2 then  Camera.CurrentSpread = weaponInfo.MinSpread
+	else  Camera.CurrentSpread = math.clamp(Camera.CurrentSpread + weaponInfo.SpreadIncrement, weaponInfo.MinSpread, weaponInfo.MaxSpread) end
 
-	-- Raycast Projection from Camera Viewport
+	lastShot = tick()
+
+	-- Cast ray from center of screen
 	local viewportRay = camera:ViewportPointToRay(camera.ViewportSize.X/2, camera.ViewportSize.Y/2)
+
 	local randomSpread = Vector3.new(
-		(math.random() - 0.5) * currentSpread,
-		(math.random() - 0.5) * currentSpread,
-		(math.random() - 0.5) * currentSpread
+		(math.random() - 0.5) * Camera.CurrentSpread,
+		(math.random() - 0.5) * Camera.CurrentSpread,
+		(math.random() - 0.5) * Camera.CurrentSpread
 	)
+
 	local shootDir = (viewportRay.Direction + randomSpread).Unit
 
-	-- Filtering Logic: Ignore user's character and non-collidable accessories
+	-- Setup raycast to ignore player and accessories
+	-- Prevents shooting yourself or having shots blocked by cosmetics
 	local rayParams = RaycastParams.new()
-	local blacklist = {player.Character, currentViewmodel}
+	local blacklist = {player.Character, Camera.CurrentViewmodel}
 
 	for _, otherPlayer in Plrs:GetPlayers() do
 		local char = otherPlayer.Character; if not char then continue end
@@ -225,304 +324,294 @@ local function shoot()
 
 	rayParams.FilterDescendantsInstances = blacklist
 	rayParams.FilterType = Enum.RaycastFilterType.Exclude
-	
+
 	local result = workspace:Raycast(viewportRay.Origin, shootDir * 500, rayParams)
 	local endPos = result and result.Position or viewportRay.Origin + (shootDir * 500)
 
-	-- Apply Visuals
-	local muzzle = currentViewmodel:FindFirstChild("Muzzle", true)
+	local muzzle = Camera.CurrentViewmodel:FindFirstChild("Muzzle", true)
 	createBeam(muzzle, endPos)
-	applyRecoil()
-	
-	-- Hit Processing
+	Camera.ApplyRecoil(WeaponHUD.EquippedWeapon)
+
+	-- Apply visual effects and check for hits
 	if result and result.Instance then
 		local char = result.Instance.Parent
+		-- Protect newly spawned players from being killed immediately
+		if char:GetAttribute("SpawnImmunity") then return end
+
 		local hum = char:FindFirstChild("Humanoid") or char.Parent:FindFirstChild("Humanoid")
 		if hum then bloodSplatter(endPos) else impactEffect(endPos) end
 	end
 
-	-- Notify Server for damage processing
 	GunMechanicsRemotes.Shoot:FireServer(equippedWeapon, endPos, result and result.Instance)
 end
 
---- Handles Semi and Full-Auto firing cycles
 local function startFiring()
-	if isFiring or not equippedWeapon then return end
+	local equippedWeapon = WeaponHUD.EquippedWeapon
+	
+	if Camera.IsFiring or not equippedWeapon then return end
 	local weaponInfo = Weapons[equippedWeapon]
 
+	-- Automatic weapons fire continuously
 	if weaponInfo.Auto then
-		isFiring = true
+		Camera.IsFiring = true
 		task.spawn(function()
-			while isFiring and equippedWeapon do
-				if os.clock() - lastShot >= weaponInfo.FireRate then shoot() end
-				task.wait() -- Minimal wait to prevent thread exhaustion
+			while Camera.IsFiring and equippedWeapon do
+				if tick() - lastShot >= weaponInfo.FireRate then shoot() end
+				task.wait()
 			end
 		end)
 	else
-		if os.clock() - lastShot >= weaponInfo.FireRate then shoot() end
+		-- Semi-automatic weapons fire once per click
+		if tick() - lastShot >= weaponInfo.FireRate then shoot() end
 	end
 end
 
 local function stopFiring()
-	isFiring = false
-	currentSpread = 0 
+	Camera.IsFiring = false
+	-- Reset spread for next engagement
+	Camera.CurrentSpread = 0
 end
 
--- [[ VIEWMODEL ENGINE ]]
-
---- Procedural Animation System: Handles ADS interpolation, Bobbing, and Sway
-local function setViewmodel(weaponName)
-	if currentViewmodel then currentViewmodel:Destroy() end
-	if viewmodelCon then viewmodelCon:Disconnect() end
-
-	local weaponModel = WeaponModelsFolder:FindFirstChild(weaponName)
-	if weaponModel then
-		currentViewmodel = weaponModel:Clone()
-
-		-- Sanitize Viewmodel for client rendering
-		for _, part in currentViewmodel:GetDescendants() do
-			if part:IsA("BasePart") then
-				part.CanCollide = false; part.CastShadow = false
-				part.CanQuery = false; part.CanTouch = false
-				part.LocalTransparencyModifier = 0 
-			end
-		end
-
-		currentViewmodel.Parent = camera 
-
-		viewmodelCon = RunS.RenderStepped:Connect(function(dt)
-			local char = player.Character
-			local root = char and char:FindFirstChild("HumanoidRootPart")
-			local hum = char and char:FindFirstChildOfClass("Humanoid")
-
-			if currentViewmodel and root and hum then
-				local weaponInfo = Weapons[equippedWeapon]
-				if not weaponInfo then return end
-
-				-- 1. Spread Recovery Interpolation
-				if not isFiring then
-					currentSpread = math.lerp(currentSpread, weaponInfo.MinSpread, dt * weaponInfo.SpreadRecovery)
-				end
-
-				-- 2. ADS Logic & Smooth FOV Transition
-				local aimSpeed = weaponInfo.AimSpeed or 10
-				local targetAlpha = (isAiming and not isReloading) and 1 or 0
-				adsAlpha = math.lerp(adsAlpha, targetAlpha, dt * aimSpeed)
-
-				local targetFOVValue = (isAiming and not isReloading) and (weaponInfo.AimFOV or 50) or defaultFOV
-				camera.FieldOfView = math.lerp(camera.FieldOfView, targetFOVValue, dt * aimSpeed)
-
-				-- 3. Procedural Bobbing & Velocity-based Jump Sway
-				local verticalVel = root.AssemblyLinearVelocity.Y
-				local targetJump = math.clamp(verticalVel * -0.015, -0.5, 0.5)
-				jumpOffset = math.lerp(jumpOffset, targetJump, dt * 10)
-
-				local horizontalSpeed = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z).Magnitude
-				bobWeight = math.lerp(bobWeight, (horizontalSpeed > 0.5 and 1 or 0), dt * 5)
-
-				local idleX, idleY = math.sin(os.clock() * 1.5) * 0.05, math.cos(os.clock() * 0.75) * 0.03
-				local walkX, walkY = math.sin(os.clock() * 10) * 0.15, math.cos(os.clock() * 14) * 0.12
-				local finalBob = CFrame.new(math.lerp(idleX, walkX, bobWeight), math.lerp(idleY, walkY, bobWeight) + jumpOffset, 0)
-
-				-- 4. Calculate Final Transformation
-				recoilOffset = recoilOffset:Lerp(CFrame.new(), dt * 8)
-				local currentOffset = weaponInfo.ViewmodelOffset:Lerp(weaponInfo.AimOffset or CFrame.new(0, -1, -2), adsAlpha)
-				local adjustedBob = finalBob:Lerp(CFrame.new(finalBob.Position * 0.1), adsAlpha)
-
-				-- 5. Positioning viewmodel relative to Camera
-				local finalCF = camera.CFrame * currentOffset * adjustedBob * recoilOffset
-				currentViewmodel:PivotTo(finalCF)
-			end
-		end)
-	end
-end
-
---- Cleanup state and viewmodel when unequipped or died
-local function clearViewmodel()
-	if currentViewmodel then
-		currentViewmodel:Destroy()
-		currentViewmodel = nil
-		if viewmodelCon then viewmodelCon:Disconnect() end
-	end
+local function handleAction(actionName, inputState)
+	if not isAlive() then return end
 	
-	isAiming = false; adsAlpha = 0
-	
-	-- Visual cleanup for FOV reset
-	local transitionBack
-	transitionBack = RunS.RenderStepped:Connect(function(dt)
-		camera.FieldOfView = math.lerp(camera.FieldOfView, defaultFOV, dt * 10)
-		if math.abs(camera.FieldOfView - defaultFOV) < 0.1 then
-			camera.FieldOfView = defaultFOV
-			transitionBack:Disconnect()
-		end
-	end)
-	
-	isFiring = false; currentSpread = 0
-	recoilOffset = CFrame.new(); camRecoil = CFrame.new(); lastShot = 0
-end
-
--- [[ INVENTORY & UI HANDLING ]]
-
---- Tweens slot visibility and highlight when switching weapons
-local function updateSlotVisuals()
-	for _, slotFrame in slotsContainer:GetChildren() do
-		if not slotFrame:IsA("Frame") then continue end
-
-		local isEquipped = (equippedWeapon == slots[tonumber(slotFrame.Name)])
-		local targetSize = isEquipped and UDim2.fromScale(1.2, 1.2) or UDim2.fromScale(1, 1)
-		local targetTextTransparency = isEquipped and 0 or 0.5
-		local targetColor = isEquipped and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(0, 0, 0)
-
-		local info = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-		TS:Create(slotFrame, info, {Size = targetSize, BackgroundColor3 = targetColor}):Play()
-
-		local nameLabel = slotFrame:FindFirstChild("WeaponName")
-		if nameLabel then
-			TS:Create(nameLabel, info, {TextTransparency = targetTextTransparency}):Play()
-		end
-	end
-end
-
---- Core Logic for Equipping/Unequipping Tools and Viewmodels
-local function toggleWeapon(weaponName: string)
-	local char = player.Character; if not char then return end
-	local hum = char:FindFirstChildOfClass("Humanoid")
-	local backpack = player:WaitForChild("Backpack")
-	
-	isReloading = false
-	local currentHeldTool = char:FindFirstChildOfClass("Tool")
-
-	-- Holster logic if clicking the same weapon
-	if currentHeldTool and currentHeldTool.Name == weaponName then
-		currentHeldTool.Parent = backpack
-		equippedWeapon = nil
-		clearViewmodel(); updateSlotVisuals(); Crosshair.ToggleCrosshair(false); ammoFrame.Visible = false
-		return 
-	end
-
-	local newTool = backpack:FindFirstChild(weaponName) or char:FindFirstChild(weaponName)
-	if newTool and newTool:IsA("Tool") then
-		updateAmmoCount(weaponName)
-		SFX.PlaySoundEffect(SFXFolder.Equip)
-		
-		clearViewmodel() 
-		hum:UnequipTools() 
-
-		Crosshair.ToggleCrosshair(true)
-		equippedWeapon = weaponName
-		newTool.Parent = char
-		setViewmodel(weaponName)
-
-		-- Hide world-model for the local player to prevent clipping with the Viewmodel
-		for _, part in newTool:GetDescendants() do
-			if part:IsA("BasePart") then part.LocalTransparencyModifier = 1 end
-		end
-	else
-		DebugService.DebugWarn("Weapon " .. weaponName .. " not found!", script)
-	end
-	
-	updateSlotVisuals()
-end
-
---- Generates a new HUD slot for a weapon
-local function newSlot(slot: number, weaponName: string)
-	local weaponInfo = Weapons[weaponName]
-	if not weaponInfo then return end
-	
-	local slotUI = weaponSlotTemplate:Clone()
-	slotUI.Name = slot; slotUI.Parent = slotsContainer; slotUI.LayoutOrder = slot
-	
-	slotUI:WaitForChild("Slot").Text = slot
-	slotUI:WaitForChild("WeaponName").Text = weaponName
-	slotUI:WaitForChild("Image").Image = weaponInfo.ImageID
-	
-	slots[slot] = weaponName
-	
-	-- Handle UI interactions for Mobile/Desktop
-	local clickBtn = Instance.new("TextButton")
-	clickBtn.Size = UDim2.fromScale(1, 1); clickBtn.BackgroundTransparency = 1; clickBtn.Text = ""
-	clickBtn.Parent = slotUI
-	clickBtn.Activated:Connect(function() stopFiring(); toggleWeapon(weaponName) end)
-	
-	slotUI.Visible = true
-end
-
--- [[ INPUT & SYSTEM INITIALIZATION ]]
-
-local function handleAction(actionName, inputState, inputObject)
 	local isBegin = (inputState == Enum.UserInputState.Begin)
 
 	if actionName == "ShootAction" then
 		if isBegin then startFiring() else stopFiring() end
+
 	elseif actionName == "ADSAction" then
 		if DeviceService.IsMobile() then
-			if isBegin then isAiming = not isAiming end
+			if isBegin then Camera.IsAiming = not Camera.IsAiming end
 		else
-			isAiming = isBegin
+			Camera.IsAiming = isBegin
 		end
+
+		if not Camera.IsAiming then Crosshair.ToggleScope(false) end
+
 	elseif actionName == "ReloadAction" then
-		if isBegin and not isReloading and equippedWeapon then
-			local data = weaponData[equippedWeapon]
-			local weaponInfo = Weapons[equippedWeapon]
+		local equippedWeapon = WeaponHUD.EquippedWeapon
+		local weaponInfo = Weapons[equippedWeapon]; if not weaponInfo then return end
+
+		if isBegin and not Camera.IsReloading and equippedWeapon then
+			local data = weaponData[equippedWeapon]; if not data then return end
 
 			if data.StoredAmmo > 0 and data.Ammo < weaponInfo.Ammo then
-				stopFiring(); isAiming = false; isReloading = true
-				ammoLabel.Text = "RELOADING..."
+				stopFiring()
+
+				Camera.IsAiming = false
+
+				Camera.IsReloading = true
+
+				WeaponHUD.ReloadingUI()
 				SFX.PlaySoundEffect(SFXFolder.Reload, nil, 1 / weaponInfo.ReloadWaitTime)
+
 				GunMechanicsRemotes.Reload:FireServer(equippedWeapon)
 			end
 		end
+
+		if not Camera.IsAiming then Crosshair.ToggleScope(false) end
+
+	elseif actionName == "SprintAction" then
+		if DeviceService.IsMobile() then
+			if isBegin then Camera.IsSprinting = not Camera.IsSprinting end
+		else
+			Camera.IsSprinting = isBegin
+		end
+
+		if not Camera.CurrentViewmodel then PlayerStatsHandler.ChangeWalkSpeed(Camera.IsSprinting and PlayerStatsHandler.SPRINT_SPEED or PlayerStatsHandler.WALK_SPEED) end
 	end
+
+	-- Pass allows other input handlers to also process this action if needed
 	return Enum.ContextActionResult.Pass
 end
 
-function module.Init()
-	pcall(function() SG:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false) end)
-	gui.Enabled = true
+local function toggleWeapon(weaponName)
+	local char = player.Character; if not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local backpack = player:WaitForChild("Backpack")
 
-	player.CharacterAdded:Connect(characterAdded)
-	if player.Character then characterAdded(player.Character) end
-	
-	-- Bind Unified Action Handling
-	CAS:BindAction("ShootAction", handleAction, true, Enum.UserInputType.MouseButton1)
-	CAS:BindAction("ADSAction", handleAction, true, Enum.UserInputType.MouseButton2)
-	CAS:BindAction("ReloadAction", handleAction, true, Enum.KeyCode.R)
+	Camera.IsReloading = false
 
-	-- HUD Shake Logic (RenderStepped)
-	RunS.RenderStepped:Connect(function(dt)
-		if ammoShake > 0.1 then
-			local offset = math.sin(os.clock() * 45) * ammoShake
-			ammoLabel.Position = originalAmmoPos + UDim2.fromOffset(offset, 0)
-			ammoShake = math.lerp(ammoShake, 0, dt * 15)
-		else
-			ammoLabel.Position = originalAmmoPos
+	local currentHeldTool = char:FindFirstChildOfClass("Tool")
+
+	-- Unequip if trying to toggle the same weapon
+	if currentHeldTool and currentHeldTool.Name == weaponName then
+		currentHeldTool.Parent = backpack
+		WeaponHUD.EquippedWeapon = nil
+
+		Camera.ClearViewmodel()
+		WeaponHUD.UpdateSlotVisuals()
+		WeaponHUD.ToggleMobileGunButtons(false)
+
+		Crosshair.ToggleCrosshair(false)
+		WeaponHUD.HideAmmoUI()
+
+		return
+	end
+
+	-- Equip the new weapon
+	local newTool = backpack:FindFirstChild(weaponName) or char:FindFirstChild(weaponName)
+
+	if newTool and newTool:IsA("Tool") then
+		WeaponHUD.UpdateAmmoCount(weaponData[weaponName])
+		WeaponHUD.ToggleMobileGunButtons(true)
+
+		SFX.PlaySoundEffect(SFXFolder.Equip)
+
+		-- Must clear old viewmodel before equipping to prevent conflicts
+		Camera.ClearViewmodel() 
+		hum:UnequipTools()
+
+		Crosshair.ToggleCrosshair(true)
+		WeaponHUD.EquippedWeapon = weaponName
+
+		newTool.Parent = char
+		Camera.SetViewmodel(weaponName)
+
+		-- Hide world model for local player
+		-- Others see the gun on your character, but you only see your viewmodel
+		for _, part in newTool:GetDescendants() do
+			if part:IsA("BasePart") then 
+				part.LocalTransparencyModifier = 1
+			end
 		end
+	else
+		DebugService.DebugWarn("Weapon " .. weaponName .. " not found in Backpack or Character!", script)
+	end
+
+	WeaponHUD.UpdateSlotVisuals()
+end
+
+local function characterAdded(char)
+	PlayerStatsHandler.ChangeWalkSpeed(PlayerStatsHandler.WALK_SPEED)
+
+	WeaponHUD.CharacterAdded()
+	Camera.SetPerspective(true)
+
+	camera.FieldOfView = Camera.BASE_FOV
+
+	local hum = char:WaitForChild("Humanoid")
+	hum.Died:Connect(function()
+		Camera.ClearViewmodel()
+		Camera.SetPerspective(false)
+		
+		Camera.IsFiring = false
+		Camera.IsReloading = false
+		Camera.IsAiming = false
+		Camera.IsSprinting = false
+
+		Crosshair.ToggleScope(false)
+		Crosshair.ToggleCrosshair(false)
+		
+		WeaponHUD.PlayedDied()
 	end)
 end
 
--- [[ NETWORKING ]]
+-- ============================================================
+--  MODULE FUNCTIONS
+-- ============================================================
 
--- Handles replication of tracers and effects from other players
+function module.Init()
+	player.CharacterAdded:Connect(characterAdded)
+	if player.Character then characterAdded(player.Character) end
+	
+	WeaponHUD.BindMobileButtons(handleAction)
+end
+
+-- ============================================================
+--  REMOTES
+-- ============================================================
+
+GunMechanicsRemotes.LoadWeaponDataClient.OnClientEvent:Connect(function(data)
+	weaponData = data
+
+	-- Create UI slots for each weapon
+	-- Dynamically generates inventory based on what player owns
+	for weaponName, d in weaponData do
+		local slot = WeaponHUD.NewSlot(d.Slot, weaponName)
+		
+		local button = slot:FindFirstChild("Button")
+		button.Activated:Connect(function()
+			stopFiring()
+			toggleWeapon(weaponName)
+		end)
+	end
+end)
+
+GunMechanicsRemotes.UpdateAmmoClient.OnClientEvent:Connect(function(weaponName, amount)
+	weaponData[weaponName].Ammo = amount
+	if weaponName == WeaponHUD.EquippedWeapon then WeaponHUD.UpdateAmmoCount(weaponData[weaponName]) end
+end)
+
+GunMechanicsRemotes.UpdateStoredAmmoClient.OnClientEvent:Connect(function(weaponName, amount)
+	weaponData[weaponName].StoredAmmo = amount
+	if weaponName == WeaponHUD.EquippedWeapon and not Camera.IsFiring then WeaponHUD.UpdateAmmoCount(weaponData[weaponName]) end
+end)
+
+-- Replicate gun effects from other players
+-- Shows visual/audio feedback when others shoot, making gameplay feel responsive
 GunMechanicsRemotes.ReplicateEffectsClient.OnClientEvent:Connect(function(shotPlayer, hitPart, endPos)
 	local char = shotPlayer.Character; if not char then return end
 	local tool = char:FindFirstChildOfClass("Tool"); if not tool then return end
 	local muzzle = tool:FindFirstChild("Muzzle"); if not muzzle then return end
-	
+
 	SFX.PlaySoundEffect(SFXFolder.Gunshot, muzzle)
 	createBeam(muzzle, endPos)
-	
+
 	if hitPart and hitPart.Parent then
-		local char = hitPart.Parent
+		char = hitPart.Parent
 		local hum = char:FindFirstChild("Humanoid") or char.Parent:FindFirstChild("Humanoid")
+
 		if hum then bloodSplatter(endPos) else impactEffect(endPos) end
 		SFX.PlaySoundEffect(SFXFolder.Hit, hitPart)
 	end
 end)
 
--- Initial data sync from Server
-GunMechanicsRemotes.LoadWeaponDataClient.OnClientEvent:Connect(function(data)
-	weaponData = data
-	for weaponName, d in weaponData do newSlot(d.Slot, weaponName) end
+GunMechanicsRemotes.Shoot.OnClientEvent:Connect(function(hitPart, damage, playerDied, endPos)
+	Crosshair.FlashHitMarker()
+	damageIndicator(endPos, damage, hitPart)
+	if playerDied then SFX.PlaySoundEffect(if hitPart.Name == "Head" then SFXFolder.Headshot else SFXFolder.Killed) end
+
+	SFX.PlaySoundEffect(SFXFolder.Hit, hitPart)
+end)
+
+-- ============================================================
+--  CONNECTIONS
+-- ============================================================
+
+UIS.InputBegan:Connect(function(input, processed)
+	if processed then return end
+
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		handleAction("ShootAction", Enum.UserInputState.Begin)
+	elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+		handleAction("ADSAction", Enum.UserInputState.Begin)
+	elseif input.KeyCode == Enum.KeyCode.R then
+		handleAction("ReloadAction", Enum.UserInputState.Begin)
+	elseif input.KeyCode == Enum.KeyCode.LeftShift then
+		handleAction("SprintAction", Enum.UserInputState.Begin)
+	end
+
+	local slot = KEY_TO_SLOT[input.KeyCode]
+	if slot and WeaponHUD.Slots[slot] and isAlive() then
+		stopFiring()
+		toggleWeapon(WeaponHUD.Slots[slot])
+	end
+end)
+
+UIS.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		handleAction("ShootAction", Enum.UserInputState.End)
+	elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+		handleAction("ADSAction", Enum.UserInputState.End)
+	elseif input.KeyCode == Enum.KeyCode.LeftShift then
+		handleAction("SprintAction", Enum.UserInputState.End)
+	end
+end)
+
+player:GetAttributeChangedSignal("Reloading"):Connect(function()
+	if not player:GetAttribute("Reloading") then SFX.StopSoundEffect(SFXFolder.Reload) end
 end)
 
 return module
